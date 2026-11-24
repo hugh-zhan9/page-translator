@@ -41,16 +41,29 @@ nav,footer ul,.metadata{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
     <span>Built by</span>
     <span class="today">215 stars today</span>
   </div></article><footer><ul><li>© 2026 Example, Inc.</li><li><a href="#terms">Terms</a></li><li><a href="#privacy">Privacy</a></li><li><a href="#security">Security</a></li><li><a href="#docs">Docs</a></li></ul></footer></main></body></html>`;
+const formatFixture = `<!doctype html><html><head><title>Source formatting fixture</title><style>
+body{margin:0;background:#fff;color:#17212b;font:20px/1.6 sans-serif}main{max-width:1000px;margin:24px auto;padding:0 20px}a{color:#185fab}p{margin:24px 0}.accent{font-weight:800;font-style:italic;color:#9a2860;background-color:#fff0bd;font-size:23px;letter-spacing:1px}@media(max-width:500px){body{font-size:16px}.accent{font-size:17px;font-weight:400}}
+</style></head><body><main><p id="bold"><strong>You have to build critical thinking into your day, because by default nothing will do it for you.</strong></p><p id="mixed">Read <strong>bold <em>and italic</em></strong>, <u>underlined</u>, <del>removed</del>, <mark>highlighted</mark>, x<sup>two</sup>, H<sub>two</sub>O and <a href="#format-target"><strong>the guide</strong> now</a>.</p><p id="styled">A <span class="accent">styled phrase</span> in a paragraph.</p><p id="breaks">First line<br>Second line <span style="white-space:pre-wrap">and preserved\n  spacing</span></p><div id="format-target"></div></main></body></html>`;
+const formatParts = new Map([
+  ['You have to build critical thinking into your day, because by default nothing will do it for you.', '你必须把批判性思维融入日常，因为默认情况下，没有什么会替你完成这件事。'],
+  ['Read', '阅读'], ['bold', '加粗'], ['and italic', '与斜体'], ['underlined', '下划线'], ['removed', '删除线'], ['highlighted', '高亮'], ['two', '二'], ['the guide', '这份指南'], ['now', '现在'], ['A', '一段'], ['styled phrase', '带样式的文字'], ['in a paragraph.', '在段落中。'], ['First line', '第一行'], ['Second line', '第二行'], ['and preserved\n  spacing', '保留换行\n  和空格'],
+]);
+const mailFixture = `<!doctype html><meta charset="utf-8"><style>.mail-row{display:grid;grid-template-columns:100px minmax(0,1fr) 60px;height:32px}.mail-row>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}iframe{width:96%;height:250px}</style>
+<nav><a href="#inbox">收 件</a> <a href="#reply">回 复</a></nav>
+<div class="mail-row" role="row"><span data-field="sender">Example Sender</span><span data-field="subject">Release is ready</span><time>昨天</time></div>
+<div class="mail-row" role="row"><span data-field="sender">Example Sender</span><span data-field="subject">您的账户通知</span><time>周一</time></div>
+<iframe id="reader" title="邮件正文" src="/message-body"></iframe><iframe title="邮件正文" sandbox srcdoc="<p>Sandbox sample</p>"></iframe><iframe hidden title="邮件正文" srcdoc="<p>Hidden sample</p>"></iframe>`;
+const messageFixture = '<!doctype html><meta charset="utf-8"><pre>Hello reader!\n\nYour release is available.</pre><code>Code sample</code><div contenteditable="true">Reply draft</div>';
 const requests = [];
 const server = createServer(async (req, res) => {
   if (req.method === 'POST') {
     let raw = ''; for await (const chunk of req) raw += chunk;
     const data = JSON.parse(raw); requests.push({ url: req.url, data });
     const texts = JSON.parse(data.input ?? data.messages?.at(-1).content ?? '{}').texts;
-    const translated = JSON.stringify({ translations: texts.map(t => linkedParts.get(t) ?? layoutParts.get(t.trim()) ?? `译${t.trim()}`) });
+    const translated = JSON.stringify({ translations: texts.map(t => linkedParts.get(t) ?? layoutParts.get(t.trim()) ?? formatParts.get(t.trim()) ?? `译${t.trim()}`) });
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: '```json\n' + translated + '\n```' }] }] }));
-  } else { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(req.url === '/layout' ? layoutFixture : fixture); }
+  } else { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(req.url === '/layout' ? layoutFixture : req.url === '/format' ? formatFixture : req.url === '/mail' ? mailFixture : req.url === '/message-body' ? messageFixture : req.url === '/foreign-message' ? '<p>Foreign message</p>' : fixture); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const address = `http://127.0.0.1:${server.address().port}`;
@@ -128,6 +141,33 @@ try {
     return { originalBottom: range.getBoundingClientRect().bottom, translationTop: output.getBoundingClientRect().top };
   });
   assert.ok(layout.translationTop >= layout.originalBottom, 'Translation must appear below the whole original paragraph');
+  const translatedAuthors = page.locator('#linked-paragraph > [data-pt-owned="translation"] a');
+  assert.equal(await translatedAuthors.count(), 1);
+  assert.equal(await translatedAuthors.textContent(), '史蒂文·肖和吉迪恩·内夫');
+  assert.equal(await translatedAuthors.evaluate(el => el.href), address + '/#authors-target');
+  await page.evaluate(() => history.pushState({}, '', '/route'));
+  assert.equal(await translatedAuthors.evaluate(el => el.href), address + '/route#authors-target');
+  await translatedAuthors.click(); await page.waitForURL(address + '/route#authors-target');
+  await page.evaluate(() => history.replaceState({}, '', '/'));
+  assert.equal(await translatedAuthors.evaluate(el => getComputedStyle(el).textDecorationLine), 'underline');
+  await translatedAuthors.click();
+  await page.waitForURL(address + '/#authors-target');
+  assert.equal(await page.evaluate(() => window.authorsClicks), 0, 'Translated links navigate natively, not by synthetic source clicks');
+  const translatedWorld = page.locator('#paragraph > [data-pt-owned="translation"] a');
+  await translatedWorld.focus(); await page.keyboard.press('Enter');
+  await page.waitForURL(address + '/#original');
+  const beforeLinkNavigation = requests.length;
+  await page.locator('#link').evaluate(el => { el.setAttribute('href', '/destination'); el.setAttribute('target', '_blank'); });
+  await page.waitForFunction(() => document.querySelector('#paragraph [data-pt-owned] a')?.getAttribute('target') === '_blank');
+  const destinationPromise = context.waitForEvent('page');
+  await translatedWorld.click();
+  const destination = await destinationPromise;
+  await destination.waitForURL(address + '/destination');
+  assert.equal(await destination.evaluate(() => window.opener === null), true);
+  await destination.close();
+  await page.locator('#link').evaluate(el => { el.setAttribute('href', '#original'); el.removeAttribute('target'); });
+  await page.waitForFunction(() => document.querySelector('#paragraph [data-pt-owned] a')?.getAttribute('href')?.endsWith('#original'));
+  assert.equal(requests.length, beforeLinkNavigation, 'Following or refreshing links must not translate again');
   await page.locator('#linked-paragraph').screenshot({ path: path.join(root, 'test-results/inline-link-bilingual.png') });
   await popup.selectOption('#mode', 'translated');
   await page.waitForFunction(() => document.querySelector('#paragraph').firstChild.data.startsWith('译'));
@@ -181,23 +221,54 @@ try {
   await page.reload();
   await page.waitForSelector('[data-pt-owned="controls"]');
   assert.equal(requests.length, beforeEnable, 'Reload must not send text');
-  // Use real pointer input; the controls intentionally live in a closed shadow root.
-  const clickFloating = async () => {
-    const box = await page.locator('[data-pt-owned="controls"]').boundingBox();
-    await page.mouse.click(box.x + box.width / 2, box.y + 26);
+  // Exercise the closed shadow root through the visible trigger and native keyboard order.
+  const controls = page.locator('[data-pt-owned="controls"]');
+  const compactBounds = async () => {
+    const box = await controls.boundingBox();
+    const viewport = page.viewportSize();
+    assert.ok(box && box.width >= 24 && box.height >= 24 && box.width <= 44 && box.height <= 44, 'Collapsed controls must occupy one compact target');
+    const rightGap = viewport.width - box.x - box.width, bottomGap = viewport.height - box.y - box.height;
+    assert.ok(rightGap >= 0 && rightGap <= 16 && bottomGap >= 0 && bottomGap <= 16, 'Trigger must sit inside the bottom-right edge');
+    return box;
   };
-  await clickFloating();
+  await compactBounds();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const triggerBox = await compactBounds();
+  await page.mouse.click(triggerBox.x + triggerBox.width / 2, triggerBox.y + triggerBox.height / 2);
+  assert.ok((await controls.boundingBox()).height > triggerBox.height);
+  await page.keyboard.press('Space');
+  await compactBounds();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Tab'); // Translate
+  assert.equal(requests.length, beforeEnable, 'Opening the controls must not send page text');
+  await page.keyboard.press('Enter');
   await page.waitForSelector('#paragraph [data-pt-owned="translation"]');
   const afterFloating = requests.length;
   assert.equal(afterFloating - beforeEnable, 1, 'Fixture paragraphs must share one request');
-  await clickFloating();
-  await page.waitForFunction(() => !document.querySelector('[data-pt-owned="translation"]'));
+  await compactBounds(); // Starting translation collapses the panel so the reader is clear.
+  await page.keyboard.press('Enter'); await page.keyboard.press('Escape');
+  await compactBounds();
+  assert.equal(await page.locator('#paragraph [data-pt-owned="translation"]').count(), 1);
+  await page.keyboard.press('Enter'); // Reopen from the returned trigger focus
+  await page.keyboard.press('Tab'); // Restore
+  await page.keyboard.press('Tab'); // Display mode
+  // Native select typeahead for 仅译文. Playwright's named-key API uses a US keyboard layout.
+  const keyboardSession = await context.newCDPSession(page);
+  await keyboardSession.send('Input.dispatchKeyEvent', { type: 'keyDown', key: '仅', text: '仅' });
+  await keyboardSession.send('Input.dispatchKeyEvent', { type: 'keyUp', key: '仅' });
+  await keyboardSession.detach();
+  await page.waitForFunction(() => document.querySelector('#paragraph').firstChild.data.startsWith('译'));
+  await page.keyboard.press('Shift+Tab');
+  await page.keyboard.press('Enter'); // Restore
+  await page.waitForFunction(() => document.querySelector('#paragraph').textContent === 'Hello world.');
   assert.equal(requests.length, afterFloating);
-  await clickFloating();
+  await page.keyboard.press('Enter'); // Translate again before closing the site
   await page.waitForSelector('#paragraph [data-pt-owned="translation"]');
-  // Close through trusted pointer input inside the closed shadow root.
-  const controlsBox = await page.locator('[data-pt-owned="controls"]').boundingBox();
-  await page.mouse.click(controlsBox.x + controlsBox.width / 2, controlsBox.y + controlsBox.height - 20);
+  await page.keyboard.press('Enter'); // Reopen
+  await page.keyboard.press('Tab'); // Restore
+  await page.keyboard.press('Tab'); // Display mode
+  await page.keyboard.press('Tab'); // Close this site
+  await page.keyboard.press('Enter');
   await page.waitForFunction(() => !document.querySelector('[data-pt-owned]'));
   assert.equal(await page.locator('#paragraph').textContent(), 'Hello world.');
   await page.reload();
@@ -206,9 +277,13 @@ try {
   await popup.reload();
   await popup.locator('#site').click();
   await page.waitForSelector('[data-pt-owned="controls"]');
-  await clickFloating();
+  await compactBounds();
+  await controls.click();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Enter');
   await page.waitForSelector('#paragraph [data-pt-owned="translation"]');
-  await clickFloating();
+  await compactBounds();
+  await page.keyboard.press('Enter'); await page.keyboard.press('Tab'); await page.keyboard.press('Enter');
   await page.waitForFunction(() => !document.querySelector('[data-pt-owned="translation"]'));
   assert.equal(await page.locator('#paragraph').textContent(), 'Hello world.');
   const otherPage = await context.newPage();
@@ -252,9 +327,82 @@ try {
   await otherPage.waitForFunction(() => !document.querySelector('[data-pt-owned="translation"]'));
   assert.equal(await otherPage.locator('body').innerHTML(), originalLayout);
   assert.equal(requests.length, beforeModeChanges);
+  await otherPage.goto(address + '/format');
+  await otherPage.setViewportSize({ width: 1280, height: 900 });
+  const formatOriginal = await otherPage.locator('main').innerHTML();
+  await otherPage.bringToFront(); await otherPopup.reload();
+  await otherPopup.getByRole('button', { name: '翻译当前页' }).click();
+  await otherPage.waitForFunction(() => document.querySelectorAll('[data-pt-owned="translation"]').length === 4);
+  const formatRequests = requests.length;
+  for (const [source, output, properties] of [
+    ['#bold > strong', '#bold > [data-pt-owned] strong', ['fontWeight', 'fontSize']],
+    ['#mixed > strong > em', '#mixed > [data-pt-owned] strong > em', ['fontWeight', 'fontStyle']],
+    ['#mixed > u', '#mixed > [data-pt-owned] u', ['textDecorationLine']],
+    ['#mixed > del', '#mixed > [data-pt-owned] del', ['textDecorationLine']],
+    ['#mixed > mark', '#mixed > [data-pt-owned] mark', ['backgroundColor']],
+    ['#mixed > sup', '#mixed > [data-pt-owned] sup', ['verticalAlign', 'fontSize']],
+    ['#mixed > sub', '#mixed > [data-pt-owned] sub', ['verticalAlign', 'fontSize']],
+    ['#styled > span', '#styled > [data-pt-owned] span', ['fontWeight', 'fontStyle', 'color', 'backgroundColor', 'fontSize', 'letterSpacing']],
+  ]) {
+    const actual = await otherPage.evaluate(({ source, output, properties }) => {
+      const a = getComputedStyle(document.querySelector(source)), b = getComputedStyle(document.querySelector(output));
+      return properties.map(name => [name, a[name], b[name]]);
+    }, { source, output, properties });
+    for (const [name, expected, value] of actual) assert.equal(value, expected, `${output}: ${name}`);
+  }
+  assert.equal(await otherPage.locator('#mixed [data-pt-owned] a strong').textContent(), '这份指南');
+  await otherPage.locator('#mixed [data-pt-owned] a').click();
+  await otherPage.waitForURL(address + '/format#format-target');
+  assert.equal(await otherPage.locator('#breaks [data-pt-owned] br').count(), 1);
+  assert.match(await otherPage.locator('#breaks [data-pt-owned] span').textContent(), /保留换行\n  和空格/);
+  await otherPage.screenshot({ path: path.join(root, 'test-results/source-format-bilingual.png'), fullPage: true });
+  await otherPage.setViewportSize({ width: 390, height: 844 });
+  await otherPage.waitForFunction(() => {
+    const span = document.querySelector('#styled > [data-pt-owned] span');
+    return getComputedStyle(span).fontSize === '17px' && getComputedStyle(span).fontWeight === '400';
+  });
+  assert.ok(await otherPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Retained typography must still fit narrow screens');
+  await otherPage.screenshot({ path: path.join(root, 'test-results/source-format-mobile.png'), fullPage: true });
+  await otherPopup.selectOption('#mode', 'translated');
+  await otherPage.waitForFunction(() => !document.querySelector('[data-pt-owned="translation"]'));
+  await otherPopup.selectOption('#mode', 'bilingual');
+  await otherPage.waitForSelector('#bold [data-pt-owned] strong');
+  await otherPopup.getByRole('button', { name: '恢复原文' }).click();
+  await otherPage.waitForFunction(() => !document.querySelector('[data-pt-owned="translation"]'));
+  assert.equal(await otherPage.locator('main').innerHTML(), formatOriginal);
+  assert.equal(requests.length, formatRequests, 'Formatting, resizing, links and mode changes must use cached translations');
+  await otherPage.goto(address + '/mail'); await otherPage.bringToFront(); await otherPopup.reload();
+  // A different loopback hostname is a different origin, even though both use this fixture server.
+  await otherPage.evaluate(async url => {
+    const frame = document.createElement('iframe'); frame.title = 'Message body'; frame.src = url;
+    const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+    document.body.append(frame); await loaded;
+  }, address.replace('127.0.0.1', 'localhost') + '/foreign-message');
+  const beforeMail = requests.length;
+  const rowGeometry = () => otherPage.locator('.mail-row').evaluateAll(rows => rows.map(row => [row.offsetTop, row.offsetHeight, row.querySelector('time').offsetLeft]));
+  const originalRows = await rowGeometry();
+  const reader = otherPage.frameLocator('#reader');
+  await otherPopup.getByRole('button', { name: '翻译当前页' }).click();
+  await reader.locator('pre > [data-pt-owned]').waitFor();
+  assert.match(await reader.locator('pre > [data-pt-owned]').textContent(), /译Hello reader!/);
+  const subjectTranslation = otherPage.locator('[data-field="subject"] > [data-pt-owned]');
+  assert.equal(await subjectTranslation.count(), 1);
+  assert.ok(await subjectTranslation.evaluate(el => el === el.parentNode.firstChild && el.title.includes('Release is ready')));
+  assert.deepEqual(await rowGeometry(), originalRows, 'Subject translations must not displace adjacent rows or the time column');
+  assert.equal(await otherPage.locator('nav [data-pt-owned],time [data-pt-owned],[data-field="sender"] [data-pt-owned],.mail-row > [data-pt-owned]').count(), 0);
+  const sentMail = requests.slice(beforeMail).flatMap(r => JSON.parse(r.data.input).texts);
+  assert.deepEqual(sentMail.sort(), ['Hello reader!\n\nYour release is available.', 'Release is ready'].sort());
+  await otherPage.locator('#reader').evaluate(el => { el.srcdoc = '<p>Next message</p>'; });
+  await reader.locator('p > [data-pt-owned]').waitFor();
+  const afterMail = requests.length;
+  await otherPopup.selectOption('#mode', 'translated');
+  await reader.getByText('译Next message', { exact: true }).waitFor();
+  await otherPopup.getByRole('button', { name: '恢复原文' }).click();
+  await reader.getByText('Next message', { exact: true }).waitFor();
+  assert.equal(requests.length, afterMail);
   assert.equal(errors.length, 0, errors.join('\n'));
   console.log(JSON.stringify({ browser: process.env.BROWSER_PATH?.includes('Microsoft Edge') ? 'Microsoft Edge' : 'Chromium', version: context.browser().version(), extensionLoaded: true, settings: true, responses: true,
-    bilingual: true, inlineLinkParagraph: true, inlineLinkLayout: true, compactHeadings: true, compactMetadata: true, compactFooter: true, mobileLayout: true, translated: true, restore: true, dynamicContent: true, continuousUpdates: true, bodyReplacement: true, hiddenContentExcluded: true,
+    mailReader: true, mailRowLayout: true, skipChinese: true, compactFloatingControls: true, bilingual: true, sourceFormatting: true, nestedFormatting: true, responsiveFormatting: true, explicitBreaks: true, translatedLinkClick: true, translatedLinkKeyboard: true, translatedLinkNewTab: true, translatedLinkRefresh: true, inlineLinkParagraph: true, inlineLinkLayout: true, compactHeadings: true, compactMetadata: true, compactFooter: true, mobileLayout: true, translated: true, restore: true, dynamicContent: true, continuousUpdates: true, bodyReplacement: true, hiddenContentExcluded: true,
     floatingControls: true, defaultFloatingControls: true, siteReload: true, siteDisable: true, siteReenable: true, batchedRequests: true, linkListenerPreserved: true, contentScriptKeyAccessDenied: true, requests: requests.length, pageErrors: errors.length }));
 } finally {
   if (context) await context.close();

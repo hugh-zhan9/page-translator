@@ -1,11 +1,137 @@
 export type Mode = 'bilingual' | 'translated';
 export interface PageStatus { active: boolean; mode: Mode; total: number; done: number; failed: number; pending: number; error: string }
 type Translator = (texts: string[]) => Promise<string[]>;
-const SKIP = 'script,style,noscript,pre,code,kbd,samp,svg,math,textarea,input,select,button,option,[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate,[data-pt-owned]';
+const SKIP = 'script,style,noscript,code,kbd,samp,svg,math,textarea,input,select,button,option,[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate,[data-pt-owned]';
+const MAIL_BODY = '[aria-label="邮件正文"],[aria-label="Message body" i],.mail-plain,#mailContent';
+const NETEASE_READER = '.gRead-content,[id^="_mail_read_"],#contentDiv';
+const MAIL_META = 'time,[data-field="sender"],[data-field="from"],[data-field="date"],.mail-sender,.mail-date';
+const MAIL_ROWS = 'tr,[role="row"],.mail-row,.nui-list-item';
+function neteaseMail(document: Document): boolean {
+  return /(^|\.)mail\.163\.com$/.test(document.location.hostname);
+}
+function mailRow(element: Element): Element | null {
+  const webmail = neteaseMail(element.ownerDocument);
+  if (element.closest(MAIL_BODY) || (webmail && element.closest(NETEASE_READER))) return null;
+  const row = element.closest(webmail ? `${MAIL_ROWS},li,[role="option"],div:has(> .nui-chk),div:has(> input[type="checkbox"])` : MAIL_ROWS);
+  if (!row) return null;
+  return webmail || row.matches('.mail-row') || row.querySelector('[data-field="sender"],[data-field="subject"]') ? row : null;
+}
+function mailField(row: Element, element: Element): Element {
+  const named = element.closest('[role="gridcell"],[role="cell"],td,[data-field],.mail-subject');
+  if (named && row.contains(named)) return named;
+  // Some inboxes wrap all columns in one clickable element. Walk through that shell
+  // until the subject has an actual sibling field so the annotation stays in its column.
+  for (let parent = row; parent !== element;) {
+    const children = [...parent.children];
+    const field = children.find(child => child.contains(element));
+    if (!field) break;
+    if (children.some(child => child !== field && !child.matches(SKIP) && child.textContent?.trim())) return field;
+    parent = field;
+  }
+  return element;
+}
+function readerDocument(frame: HTMLIFrameElement): Document | null {
+  const parent = frame.ownerDocument;
+  const identified = frame.closest(MAIL_BODY) || /邮件正文|mail content|message body/i.test(`${frame.title} ${frame.name} ${frame.getAttribute('aria-label') ?? ''}`) ||
+    (neteaseMail(parent) && (frame.matches('.oD0,[id^="readmail" i]') || frame.closest('.gRead-content') || /\/read(?:\/|html\.)/i.test(frame.getAttribute('src') ?? '')));
+  if ((!identified && !neteaseMail(parent)) || !frame.isConnected || frame.closest(SKIP + ',pre,[hidden],[aria-hidden="true"]') ||
+    (frame.hasAttribute('sandbox') && !frame.getAttribute('sandbox')!.toLowerCase().split(/\s+/).includes('allow-same-origin'))) return null;
+  for (let el: Element | null = frame; el; el = el.parentElement) {
+    const style = parent.defaultView!.getComputedStyle(el);
+    if (style.display === 'none' || /^(hidden|collapse)$/.test(style.visibility) || style.contentVisibility === 'hidden' ||
+      (el === frame && (parseFloat(style.width) <= 1 || parseFloat(style.height) <= 1)) ||
+      (el.matches('details:not([open])') && !el.querySelector(':scope > summary')?.contains(frame))) return null;
+  }
+  // contentDocument is null for inaccessible frames. Check the loaded document as well as the embedding context.
+  const child = frame.contentDocument;
+  if (!child || (child.location.origin !== parent.location.origin && !/^about:(blank|srcdoc)$/.test(child.URL))) return null;
+  if (!child.body || child.contentType !== 'text/html' || child.designMode?.toLowerCase() === 'on') return null;
+  // NetEase can initialize an untitled reader in about:blank before populating the message container.
+  return identified || child.querySelector(MAIL_BODY + ',#contentDiv') ? child : null;
+}
 const HEADINGS = 'h1,h2,h3,h4,h5,h6,[role="heading"]';
 const PARAGRAPHS = `p,${HEADINGS},li,td,th,dt,dd,blockquote,figcaption`;
-interface NodeText { node: Text; source: string; translated?: string }
-interface RecordEntry { block: Element; nodes: NodeText[]; state: 'pending' | 'working' | 'done' | 'error'; output?: HTMLElement; error?: string; values?: string[] }
+const LINK_ATTRIBUTES = ['target', 'rel', 'download', 'referrerpolicy', 'title'] as const;
+interface NodeText { node: Text; source: string; link: HTMLAnchorElement | null; translated?: string }
+interface RecordEntry { block: Element; nodes: NodeText[]; state: 'pending' | 'working' | 'done' | 'error'; output?: HTMLElement; error?: string; values?: string[]; presentation?: string }
+const TEXT_STYLES = ['font-weight', 'font-style', 'font-size', 'font-family', 'font-variant', 'line-height',
+  'letter-spacing', 'word-spacing', 'color', 'background-color', 'text-decoration-line', 'text-decoration-style',
+  'text-decoration-color', 'text-decoration-thickness', 'vertical-align', 'white-space'] as const;
+const INLINE_TAGS = new Set(['strong', 'b', 'em', 'i', 'u', 's', 'del', 'ins', 'mark', 'small', 'sub', 'sup']);
+type TextView = string | { tag: string; styles: [string, string][]; attributes: [string, string][]; children: TextView[] };
+function translatedView(document: Document, record: RecordEntry): TextView[] {
+  const styles = new Map<Element, CSSStyleDeclaration>();
+  const styleOf = (element: Element) => {
+    if (!styles.has(element)) styles.set(element, document.defaultView!.getComputedStyle(element));
+    return styles.get(element)!;
+  };
+  const ancestors = new Set<Element>();
+  const parts = record.nodes.map((node, i) => {
+    for (let element = node.node.parentElement; element && element !== record.block; element = element.parentElement) ancestors.add(element);
+    const whiteSpace = styleOf(node.node.parentElement!).whiteSpace || styleOf(record.block).whiteSpace || 'normal';
+    const collapse = /^(normal|nowrap)$/.test(whiteSpace);
+    return { node: node.node, collapse, text: collapse ? record.values![i].replace(/[\t\n\r\f ]+/g, ' ') : record.values![i] };
+  });
+  // Trim paragraph edges only; never trim the two sides of each styled fragment.
+  let seenText = false, trailingSpace = false;
+  for (const part of parts) {
+    if (!seenText) part.text = part.text.trimStart();
+    else if (part.collapse && trailingSpace) part.text = part.text.replace(/^ /, '');
+    if (part.text) { seenText = true; trailingSpace = part.collapse && part.text.endsWith(' '); }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    parts[i].text = parts[i].text.trimEnd();
+    if (parts[i].text) break;
+  }
+  const texts = new Map(parts.map(part => [part.node, part.text]));
+  const insideLink = record.block.closest('a');
+  function project(node: Node): TextView[] {
+    if (node.nodeType === 3) return texts.has(node as Text) ? [texts.get(node as Text)!] : [];
+    if (node.nodeType !== 1) return [];
+    const element = node as HTMLElement;
+    const tag = element.localName;
+    if (element.closest(SKIP)) return [];
+    const style = styleOf(element);
+    if (element.hidden || element.getAttribute('aria-hidden') === 'true' || style.display === 'none' ||
+      ['hidden', 'collapse'].includes(style.visibility) || style.contentVisibility === 'hidden') return [];
+    if (tag === 'br') return [{ tag: 'br', styles: [], attributes: [], children: [] }];
+    if (!ancestors.has(element)) {
+      // A visible inline wrapper may contain only a break, so it has no managed text ancestor path.
+      const inline = !style.display || style.display.startsWith('inline') || style.display === 'contents';
+      if (!inline || element.matches(PARAGRAPHS + ',details') || !element.querySelector('br')) return [];
+    }
+    const children = [...element.childNodes].flatMap(project);
+    if (!children.length) return [];
+    const view: Exclude<TextView, string> = { tag: INLINE_TAGS.has(tag) ? tag : 'span',
+      styles: TEXT_STYLES.map(name => [name, style.getPropertyValue(name)]), attributes: [], children };
+    if (!insideLink && tag === 'a') {
+      const link = element as HTMLAnchorElement;
+      if (link.hasAttribute('href') && /^(https?:|mailto:|tel:)$/.test(link.protocol)) {
+        view.tag = 'a';
+        // Raw href preserves native relative URL resolution after history/base changes.
+        view.attributes.push(['href', link.getAttribute('href')!]);
+        for (const name of LINK_ATTRIBUTES) {
+          const value = link.getAttribute(name);
+          if (value !== null && name !== 'rel') view.attributes.push([name, value]);
+        }
+        view.attributes.push(['rel', [...link.relList].filter(token => token.toLowerCase() !== 'opener').concat('noopener').join(' ')]);
+        view.styles.push(['text-decoration-line', 'underline']);
+      }
+    }
+    return [view];
+  }
+  return [...record.block.childNodes].flatMap(project);
+}
+function appendView(document: Document, parent: Node, views: TextView[]) {
+  for (const view of views) {
+    if (typeof view === 'string') { parent.appendChild(document.createTextNode(view)); continue; }
+    const element = document.createElement(view.tag);
+    for (const [name, value] of view.styles) if (value) element.style.setProperty(name, value, 'important');
+    if (view.tag !== 'br') element.style.setProperty('display', 'inline', 'important');
+    for (const [name, value] of view.attributes) element.setAttribute(name, value);
+    appendView(document, element, view.children); parent.appendChild(element);
+  }
+}
 export function splitText(text: string, limit = 2400): string[] {
   const result: string[] = [];
   let rest = text;
@@ -21,7 +147,7 @@ export function splitText(text: string, limit = 2400): string[] {
   if (rest) result.push(rest);
   return result;
 }
-export function collect(document: Document, sourceOf: (node: Text) => string = node => node.data): Map<Element, NodeText[]> {
+export function collect(document: Document, sourceOf: (node: Text) => string = node => node.data, reader = false): Map<Element, NodeText[]> {
   const groups = new Map<Element, NodeText[]>();
   if (!document.body) return groups;
   const visibility = new Map<Element, boolean>();
@@ -78,9 +204,20 @@ export function collect(document: Document, sourceOf: (node: Text) => string = n
     const parent = text.parentElement;
     const source = sourceOf(text);
     if (!parent || !source || parent.closest(SKIP) || !visible(parent) || inClosedDetails(text)) continue;
-    const block = blockOf(parent);
+    const pre = parent.closest('pre');
+    if (pre) {
+      // Some readers put a whole plaintext message in a single pre. Code samples remain protected.
+      const plainBody = pre.closest(MAIL_BODY) || ((reader || neteaseMail(document)) && pre.closest(NETEASE_READER)) ||
+        (reader && (pre.parentElement === document.body || document.body.querySelectorAll('pre').length === 1));
+      if (!plainBody || pre.matches('[class*="language-"],[class*="highlight"],[data-language]') || pre.querySelector('code,kbd,samp') ||
+        /(?:^|\n)\s*(?:const |let |var |function |import |class |def |#!)|[{};]\s*(?:\n|$)/m.test(source)) continue;
+    }
+    const row = reader ? null : mailRow(parent);
+    if (row && parent.closest(MAIL_META)) continue;
+    // Mail list rows can position inline sender, subject and time spans as independent columns.
+    const block = pre ?? (row ? mailField(row, parent) : blockOf(parent));
     const nodes = groups.get(block) ?? [];
-    nodes.push({ node: text, source }); groups.set(block, nodes);
+    nodes.push({ node: text, source, link: parent.closest<HTMLAnchorElement>('a') }); groups.set(block, nodes);
   }
   // Keep separators inside a paragraph, but do not translate empty layout containers.
   for (const [block, nodes] of groups) {
@@ -96,6 +233,11 @@ export class PageTranslation {
   private observer: MutationObserver;
   private timer?: ReturnType<typeof setTimeout>;
   private workers = 0;
+  private readers = new Map<Document, HTMLIFrameElement>();
+  private onResize = () => this.scheduleScan();
+  private onFrameLoad = (event: Event) => {
+    if ((event.target as Element)?.localName === 'iframe') this.scheduleScan();
+  };
   constructor(private document: Document, private translator: Translator) {
     this.observer = new document.defaultView!.MutationObserver(() => this.scheduleScan());
   }
@@ -105,9 +247,10 @@ export class PageTranslation {
     this.timer = setTimeout(() => { this.timer = undefined; this.scan(); }, 180);
   }
   private observe() {
-    if (this.active) this.observer.observe(this.document, {
+    if (!this.active) return;
+    for (const doc of [this.document, ...this.readers.keys()]) this.observer.observe(doc, {
       childList: true, characterData: true, subtree: true, attributes: true,
-      attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'translate', 'contenteditable', 'open'],
+      attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'translate', 'contenteditable', 'open', 'href', 'src', 'srcdoc', 'sandbox', 'aria-label', ...LINK_ATTRIBUTES],
     });
   }
   private mutate(action: () => void) {
@@ -118,7 +261,11 @@ export class PageTranslation {
   }
   start(mode: Mode = 'bilingual'): PageStatus {
     this.mode = mode;
-    if (!this.active) { this.active = true; this.epoch++; }
+    if (!this.active) {
+      this.active = true; this.epoch++;
+      this.document.defaultView!.addEventListener('resize', this.onResize);
+      this.document.addEventListener('load', this.onFrameLoad, true);
+    }
     this.mutate(() => { for (const record of this.records.values()) if (this.intact(record)) this.render(record); });
     this.scan(); return this.status();
   }
@@ -129,6 +276,9 @@ export class PageTranslation {
   }
   stop(): PageStatus {
     this.active = false; this.epoch++; clearTimeout(this.timer); this.timer = undefined; this.observer.disconnect();
+    this.document.defaultView!.removeEventListener('resize', this.onResize);
+    this.document.removeEventListener('load', this.onFrameLoad, true);
+    this.readers.clear();
     for (const record of this.records.values()) this.restore(record);
     this.records.clear(); return this.status();
   }
@@ -142,7 +292,7 @@ export class PageTranslation {
   }
   private intact(record: RecordEntry): boolean {
     return record.block.isConnected && record.nodes.every(n => n.node.isConnected &&
-      record.block.contains(n.node) && n.node.data === (n.translated ?? n.source));
+      record.block.contains(n.node) && n.node.parentElement?.closest('a') === n.link && n.node.data === (n.translated ?? n.source));
   }
   private restore(record: RecordEntry) {
     record.output?.remove(); record.output = undefined;
@@ -151,50 +301,74 @@ export class PageTranslation {
       n.translated = undefined;
     }
   }
-  private render(record: RecordEntry) {
+  private render(record: RecordEntry, projected?: TextView[]) {
     if (record.state !== 'done') return;
     // Values are retained separately so switching modes never requires a new API call.
     const values = record.values!;
+    const document = record.block.ownerDocument;
+    const view = projected ?? translatedView(document, record);
+    record.presentation = JSON.stringify(view);
     record.output?.remove(); record.output = undefined;
     record.nodes.forEach((n, i) => {
       n.node.data = this.mode === 'translated' ? values[i] : n.source;
       n.translated = this.mode === 'translated' ? values[i] : undefined;
     });
     if (this.mode === 'bilingual') {
-      const style = this.document.defaultView!.getComputedStyle(record.block);
+      const style = document.defaultView!.getComputedStyle(record.block);
       const whiteSpace = style.whiteSpace || 'normal';
       const normalize = (text: string) => /^(normal|nowrap)$/.test(whiteSpace) ? text.replace(/[\t\n\r\f ]+/g, ' ').trim() : text.trim();
       const source = normalize(record.nodes.map(n => n.source).join(''));
       const translation = normalize(values.join(''));
       if (!translation || translation === source) return;
-      const parentDisplay = record.block.parentElement ? this.document.defaultView!.getComputedStyle(record.block.parentElement).display : '';
+      const parentDisplay = record.block.parentElement ? document.defaultView!.getComputedStyle(record.block.parentElement).display : '';
       const navigationItem = !!record.block.closest('nav,footer,[role="navigation"],[role="tablist"]') && source.length <= 120;
-      const inline = record.block.matches(HEADINGS) ||
+      const inboxField = document === this.document && !!mailRow(record.block);
+      const inline = inboxField || record.block.matches(HEADINGS) ||
         (record.block.matches('li') && navigationItem) ||
         (!record.block.matches(PARAGRAPHS) && (record.block.matches('a,[role="link"],[role="tab"]') ||
           style.display.startsWith('inline') || /^(inline-)?(flex|grid)$/.test(parentDisplay) || navigationItem));
-      const output = this.document.createElement('span');
+      const output = document.createElement('span');
       output.dataset.ptOwned = 'translation'; output.lang = 'und';
       output.style.cssText = inline
         ? 'display:inline!important;margin:0!important;padding:0!important;border-inline-start:0!important;opacity:0.85;'
         : 'display:block!important;margin:0.35em 0!important;padding:0 0 0 0.7em!important;border-inline-start:2px solid #7889a8!important;opacity:0.9;';
       output.style.setProperty('white-space', whiteSpace, 'important');
-      output.textContent = inline ? `（${translation}）` : translation;
-      record.block.append(output); record.output = output;
+      if (inline) output.append('（');
+      appendView(document, output, view);
+      if (inline) output.append('）');
+      // A subject cell with ellipsis can clip the entire appended translation. Keep both in the
+      // cell, with the translation visible first and the full pair available on hover.
+      if (inboxField && style.textOverflow === 'ellipsis') {
+        output.title = `${translation}\n${source}`;
+        record.block.prepend(output);
+      } else record.block.append(output);
+      record.output = output;
     }
   }
   private scan() {
     if (!this.active) return;
     this.mutate(() => {
+      this.readers.clear();
+      for (const frame of this.document.querySelectorAll('iframe')) {
+        const child = readerDocument(frame);
+        if (child) this.readers.set(child, frame);
+      }
       // Restore only our untouched writes. Site-authored replacements always win.
       for (const [block, record] of this.records) {
-        if (!this.intact(record)) { this.restore(record); this.records.delete(block); }
+        if ((block.ownerDocument !== this.document && !this.readers.has(block.ownerDocument)) || !this.intact(record)) {
+          this.restore(record); this.records.delete(block);
+        }
       }
       const sources = new Map<Text, string>();
       for (const record of this.records.values()) for (const node of record.nodes) sources.set(node.node, node.source);
       // Classify our own translated nodes using their original text (e.g. twenty-five → 25).
       const sourceOf = (node: Text) => sources.get(node) ?? node.data;
-      const groups = collect(this.document, sourceOf);
+      const collectAll = () => {
+        const groups = collect(this.document, sourceOf);
+        for (const doc of this.readers.keys()) for (const [block, nodes] of collect(doc, sourceOf, true)) groups.set(block, nodes);
+        return groups;
+      };
+      const groups = collectAll();
       for (const [block, record] of this.records) {
         const nodes = groups.get(block);
         if (!nodes || nodes.length !== record.nodes.length || nodes.some((n, i) => n.node !== record.nodes[i].node)) {
@@ -202,8 +376,13 @@ export class PageTranslation {
         }
       }
       // Recollect after restoration so new snapshots never capture our translation as source.
-      for (const [block, nodes] of collect(this.document, sourceOf)) {
+      for (const [block, nodes] of collectAll()) {
         if (!this.records.has(block)) this.records.set(block, { block, nodes, state: 'pending' });
+      }
+      for (const record of this.records.values()) {
+        if (record.state !== 'done') continue;
+        const view = translatedView(record.block.ownerDocument, record);
+        if (record.presentation !== JSON.stringify(view)) this.render(record, view);
       }
     });
     this.pump();
@@ -219,7 +398,13 @@ export class PageTranslation {
     }
   }
   private async processBatch(records: RecordEntry[], epoch: number) {
-    const current = (record: RecordEntry) => this.active && epoch === this.epoch && this.records.get(record.block) === record;
+    const current = (record: RecordEntry) => {
+      if (!this.active || epoch !== this.epoch || this.records.get(record.block) !== record) return false;
+      const doc = record.block.ownerDocument;
+      if (doc === this.document) return true;
+      const frame = this.readers.get(doc);
+      return !!frame && readerDocument(frame) === doc;
+    };
     try {
       type Piece = { record: RecordEntry; nodeIndex: number; source: string };
       const pieces: Piece[] = records.flatMap(record => record.nodes.flatMap((node, nodeIndex) =>

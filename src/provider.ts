@@ -39,11 +39,36 @@ export function responseText(data: any, provider: 'responses' | 'chat'): string 
   if (!parts.length) throw new Error('模型未返回翻译文本。');
   return parts.join('');
 }
+type ChineseTarget = 'Hans' | 'Hant' | 'either';
+
+function chineseTarget(language: string): ChineseTarget | undefined {
+  const name = language.toLowerCase().replace(/[\s()（）]/g, '').replace(/_/g, '-');
+  if (/^(?:中文|汉语|漢語|chinese|zh)$/.test(name)) return 'either';
+  if (/^(?:[简簡][体體](?:中文)?|中文[简簡][体體]|simplifiedchinese|chinesesimplified|zh-(?:hans(?:-[a-z]{2})?|cn|sg|my))$/.test(name)) return 'Hans';
+  if (/^(?:繁[体體](?:中文)?|中文繁[体體]|traditionalchinese|chinesetraditional|zh-(?:hant(?:-[a-z]{2})?|tw|hk|mo))$/.test(name)) return 'Hant';
+}
+
+// Han alone is ambiguous across languages. Treat it as Chinese unless other
+// letters or common opposite-script spellings signal a need for translation.
+// The spelling cues cover common text; they are not a conversion dictionary.
+function alreadyChinese(text: string, target: ChineseTarget): boolean {
+  if (!/\p{Script=Han}/u.test(text)) return false;
+  if (target === 'Hans' && /[這們個為從對還進過時與開關發聯絡郵設帳戶號讀寫請簡體漢語譯頁網覽選項標記刪編輯檔夾歸類動顯處載複僅傳輸認訂務歡線會話組員間題學國見長門愛實數據幫現詢錄碼內廣閱電換謝買賣臺灣龍風車書資訊點擊測試]/u.test(text)) return false;
+  if (target === 'Hant' && /[这们个为从对还进过时与开关发联络邮设账户号读写请简体汉语译页网览选项标记删编辑档夹归类动显处载复仅传输认订务欢线会话组员间题学国见长门爱实数据帮现询录码内广阅电换谢买卖湾龙风车书资讯点击测试]/u.test(text)) return false;
+  // Allow an isolated brand or acronym, while preserving ordinary English subjects
+  // (including single words) and any text containing kana, hangul or other scripts.
+  const words = text.replace(/\p{Script=Han}/gu, ' ').match(/[^\p{P}\p{S}\p{N}\s]+/gu) ?? [];
+  return words.length === 0 || /^(?:[A-Za-z]*[a-z][A-Z][A-Za-z]*|Gmail|Google(?: Meet| Workspace| Drive)?|Microsoft(?: Teams)?|Outlook|Chrome|Gemini|API|AI|PDF|URL|HTML|SMS|USB|VIP|ID)$/u.test(words.join(' '));
+}
 export async function translate(settings: Settings, input: unknown, fetcher: typeof fetch = fetch): Promise<string[]> {
   const texts = validateTexts(input);
   const baseUrl = normalizeBaseUrl(settings.baseUrl);
+  const target = chineseTarget(settings.targetLanguage);
+  const pending = texts.map((text, index) => ({ text, index }))
+    .filter(({ text }) => !target || !alreadyChinese(text, target));
+  if (!pending.length) return texts;
   const system = instructions(settings.targetLanguage);
-  const user = JSON.stringify({ texts });
+  const user = JSON.stringify({ texts: pending.map(item => item.text) });
   const signal = AbortSignal.timeout(90_000);
   // Never forward credentials on redirects; no cookies, referrers, retries or fallback models.
   const safeFetch: typeof fetch = (url, init) => fetcher(url, {
@@ -77,7 +102,10 @@ export async function translate(settings: Settings, input: unknown, fetcher: typ
     try { data = await response.json(); } catch { throw new Error('API 没有返回 JSON。'); }
     result = responseText(data, settings.provider);
   }
-  return parseTranslations(result, texts.length);
+  const translations = parseTranslations(result, pending.length);
+  const merged = [...texts];
+  pending.forEach(({ index }, i) => { merged[index] = translations[i]; });
+  return merged;
 }
 export function safeError(error: unknown, key?: string): string {
   let text = error instanceof Error ? error.message : '操作失败。';

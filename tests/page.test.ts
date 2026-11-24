@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { collect, PageTranslation, splitText } from '../src/page';
 const sessions: PageTranslation[] = [];
-afterEach(() => { sessions.forEach(s => s.stop()); sessions.length = 0; document.body.innerHTML = ''; });
+afterEach(() => { sessions.forEach(s => s.stop()); sessions.length = 0; vi.restoreAllMocks(); document.body.innerHTML = ''; });
 const make = (translator = async (texts: string[]) => texts.map(t => `译${t.trim()}`)) => {
   const page = new PageTranslation(document, translator); sessions.push(page); return page;
 };
@@ -53,6 +53,213 @@ describe('live webpage translation', () => {
     expect(paragraph.querySelectorAll('[data-pt-owned="translation"]')).toHaveLength(1);
     expect(translate).toHaveBeenCalledOnce();
     page.stop(); expect(paragraph.innerHTML).toBe(original);
+  });
+  it('renders distinct translated links from source nodes, merging wrappers without guessing from repeated words', async () => {
+    document.body.innerHTML = '<p>Read <a id="first" href="/first" target="_blank" rel="nofollow opener" style="color:rgb(12, 34, 56)" onclick="return false"><em>the</em> <strong>guide</strong></a>, then <a href="/second">guide</a>.</p>';
+    const original = document.body.innerHTML, first = document.querySelector('a')!;
+    const clicked = vi.fn(); first.addEventListener('click', clicked);
+    const translate = vi.fn(async (texts: string[]) => texts.map(t => ({ Read: '阅读', the: '这份', guide: '指南', ', then': '，然后' })[t.trim()] ?? t));
+    const page = make(translate); page.start(); await completed(page);
+    const output = document.querySelector('[data-pt-owned="translation"]')!;
+    const links = [...output.querySelectorAll('a')];
+    expect(links.map(a => a.textContent)).toEqual(['这份 指南', '指南']);
+    expect(links.map(a => a.href)).toEqual([new URL('/first', document.baseURI).href, new URL('/second', document.baseURI).href]);
+    expect(links[0].target).toBe('_blank');
+    expect(links[0].relList.contains('nofollow')).toBe(true);
+    expect(links[0].relList.contains('noopener')).toBe(true);
+    expect(links[0].relList.contains('opener')).toBe(false);
+    expect(links[0].style.color).toBe('rgb(12, 34, 56)');
+    expect(links[0].style.textDecorationLine).toBe('underline');
+    expect(links[0].style.display).toBe('inline');
+    expect(links[0].hasAttribute('id')).toBe(false);
+    expect(links[0].hasAttribute('onclick')).toBe(false);
+    expect(links[0].querySelector('em')?.textContent).toBe('这份');
+    expect(links[0].querySelector('strong')?.textContent).toBe('指南');
+    page.setMode('translated');
+    expect(document.querySelector('a')).toBe(first);
+    first.click(); expect(clicked).toHaveBeenCalledOnce();
+    page.setMode('bilingual'); await completed(page);
+    expect(document.querySelectorAll('[data-pt-owned] a')).toHaveLength(2);
+    expect(translate).toHaveBeenCalledOnce();
+    page.stop(); expect(document.body.innerHTML).toBe(original);
+  });
+  it('keeps heading links clickable without nesting anchors in standalone links or linked cards', async () => {
+    document.body.innerHTML = '<h2><a href="#title">Title</a></h2><nav><a href="#docs">Docs</a></nav><a href="#card"><h3>Card</h3><p>Description</p></a>';
+    const page = make(); page.start(); await completed(page);
+    expect(document.querySelector<HTMLAnchorElement>('h2 > [data-pt-owned] a')?.href).toBe(new URL('#title', document.baseURI).href);
+    expect(document.querySelectorAll('a a')).toHaveLength(0);
+    expect(document.querySelector('nav a [data-pt-owned]')?.textContent).toBe('（译Docs）');
+    expect(document.querySelector('a h3 [data-pt-owned]')?.textContent).toBe('（译Card）');
+  });
+  it('uses only safe source destinations, not model HTML or copied executable attributes', async () => {
+    document.body.innerHTML = '<p>See <a href="java&#10;script:alert(1)">script</a> <a href="data:text/html,bad">data</a> <a href="mailto:test@example.com">email</a> <a href="tel:+123">phone</a> <a href="/safe" ping="/track" onmouseover="alert(1)">safe</a>.</p>';
+    const page = make(async texts => texts.map(t => t.trim() === 'safe' ? '<img src=x onerror=alert(1)>' : `译${t}`));
+    page.start(); await completed(page);
+    const output = document.querySelector('[data-pt-owned]')!;
+    expect([...output.querySelectorAll<HTMLAnchorElement>('a[href]')].map(a => a.href)).toEqual(['mailto:test@example.com', 'tel:+123', new URL('/safe', document.baseURI).href]);
+    expect(output.querySelector('img,script,[ping],[onmouseover]')).toBeNull();
+    expect(output.textContent).toContain('<img src=x onerror=alert(1)>');
+  });
+  it('keeps relative and fragment destinations aligned after history navigation without DOM changes', async () => {
+    const originalUrl = location.href;
+    try {
+      history.replaceState({}, '', '/old/');
+      document.body.innerHTML = '<p>See <a href="#details">details</a> or <a href="guide">guide</a>.</p>';
+      const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
+      const page = make(translate); page.start(); await completed(page);
+      history.pushState({}, '', '/new/');
+      const originals = [...document.querySelectorAll<HTMLAnchorElement>('p > a')];
+      const copies = [...document.querySelectorAll<HTMLAnchorElement>('[data-pt-owned] a')];
+      expect(copies.map(a => a.href)).toEqual(originals.map(a => a.href));
+      expect(translate).toHaveBeenCalledOnce();
+    } finally { history.replaceState({}, '', originalUrl); }
+  });
+  it('refreshes equivalent raw destinations before a later route change', async () => {
+    const originalUrl = location.href;
+    try {
+      history.replaceState({}, '', '/');
+      document.body.innerHTML = '<p>See <a href="/guide">guide</a>.</p>';
+      const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
+      const page = make(translate); page.start(); await completed(page);
+      document.querySelector('p > a')!.setAttribute('href', 'guide');
+      await vi.waitFor(() => expect(document.querySelector('[data-pt-owned] a')?.getAttribute('href')).toBe('guide'));
+      history.pushState({}, '', '/new/');
+      expect(document.querySelector<HTMLAnchorElement>('[data-pt-owned] a')?.href).toBe(new URL('guide', location.href).href);
+      expect(translate).toHaveBeenCalledOnce();
+    } finally { history.replaceState({}, '', originalUrl); }
+  });
+  it('refreshes translated destinations after source attribute changes without translating again', async () => {
+    document.body.innerHTML = '<p>See <a href="/old">guide</a>.</p>';
+    const source = document.querySelector('a')!;
+    const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
+    const page = make(translate); page.start(); await completed(page);
+    expect(document.querySelector<HTMLAnchorElement>('[data-pt-owned] a')?.href).toBe(new URL('/old', document.baseURI).href);
+    source.setAttribute('href', '/new'); source.setAttribute('target', '_blank');
+    await vi.waitFor(() => expect(document.querySelector<HTMLAnchorElement>('[data-pt-owned] a')?.href).toBe(new URL('/new', document.baseURI).href));
+    expect(document.querySelector<HTMLAnchorElement>('[data-pt-owned] a')?.target).toBe('_blank');
+    source.setAttribute('href', 'javascript:alert(1)');
+    await vi.waitFor(() => expect(document.querySelector('[data-pt-owned] a[href]')).toBeNull());
+    expect(translate).toHaveBeenCalledOnce();
+    page.stop(); expect(source.getAttribute('href')).toBe('javascript:alert(1)');
+  });
+  it('retains whole-paragraph and nested inline formatting, including formatting inside links', async () => {
+    document.body.innerHTML = '<p><strong>Build critical thinking every day.</strong></p><p>Read <strong>bold <em>and italic</em></strong>, <u>underlined</u>, <s>deleted</s>, <mark>highlighted</mark>, x<sup>two</sup>, H<sub>two</sub>O and <a href="#guide"><strong>the guide</strong> now</a>.</p>';
+    const original = document.body.innerHTML, sourceLink = document.querySelector('a');
+    const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t.trim()}`));
+    const page = make(translate); page.start(); await completed(page);
+    const outputs = [...document.querySelectorAll('[data-pt-owned="translation"]')];
+    expect(outputs[0].querySelector('strong')?.textContent).toBe('译Build critical thinking every day.');
+    expect(outputs[1].querySelector('strong em')?.textContent).toBe('译and italic');
+    for (const tag of ['u', 's', 'mark', 'sup', 'sub']) expect(outputs[1].querySelector(tag)?.textContent).toContain('译');
+    expect(outputs[1].querySelector('a strong')?.textContent).toBe('译the guide');
+    expect(outputs[1].querySelectorAll('a')).toHaveLength(1);
+    page.setMode('translated'); expect(document.querySelector('a')).toBe(sourceLink);
+    page.setMode('bilingual'); expect(document.querySelector('p [data-pt-owned] strong')).not.toBeNull();
+    expect(translate).toHaveBeenCalledOnce();
+    page.stop(); expect(document.body.innerHTML).toBe(original);
+  });
+  it('copies computed text formatting without copying layout, selectors, events or protected content', async () => {
+    document.body.innerHTML = '<style>.source-format{font-weight:800;font-style:italic;color:rgb(12,34,56);background-color:rgb(255,240,100);font-size:21px;line-height:30px;letter-spacing:2px;position:fixed;width:700px;margin:90px;background-image:url(/not-copied)}</style><p>Normal <span class="source-format" id="styled" onclick="alert(1)">formatted</span> <code>protected</code></p>';
+    const page = make(); page.start(); await completed(page);
+    const output = document.querySelector('[data-pt-owned]')!;
+    const span = output.querySelector<HTMLElement>('span')!;
+    expect(span).not.toBeNull();
+    expect(span.style.fontWeight).toBe('800'); expect(span.style.fontStyle).toBe('italic');
+    expect(span.style.color).toBe('rgb(12, 34, 56)'); expect(span.style.backgroundColor).toBe('rgb(255, 240, 100)');
+    expect(span.style.fontSize).toBe('21px'); expect(span.style.lineHeight).toBe('30px'); expect(span.style.letterSpacing).toBe('2px');
+    expect(span.style.position).toBe(''); expect(span.style.width).toBe(''); expect(span.style.margin).toBe(''); expect(span.style.backgroundImage).toBe('');
+    expect(output.querySelector('[id],[class],[onclick],code,style')).toBeNull();
+    expect(output.textContent).not.toContain('protected');
+  });
+  it('retains explicit breaks and nested pre-wrap without flattening them or exposing hidden breaks', async () => {
+    document.body.innerHTML = '<p>First<br>Second <strong>bold<br>next</strong><br hidden><span style="white-space:pre-wrap">line one\n  line two</span></p>';
+    const original = document.body.innerHTML;
+    const page = make(); page.start(); await completed(page);
+    const output = document.querySelector('[data-pt-owned]')!;
+    expect(output.querySelectorAll('br')).toHaveLength(2);
+    expect(output.querySelector('strong br')).not.toBeNull();
+    expect(output.querySelector('span')?.textContent).toBe('译line one\n  line two');
+    page.stop(); expect(document.body.innerHTML).toBe(original);
+  });
+  it('retains visible break-only inline wrappers without copying hidden or protected breaks', async () => {
+    document.body.innerHTML = '<p>First<span><b><br></b></span>Second<span hidden><br></span><span translate="no"><br></span><span style="display:none"><br></span></p>';
+    const page = make(); page.start(); await completed(page);
+    const output = document.querySelector('[data-pt-owned]')!;
+    expect(output.querySelectorAll('br')).toHaveLength(1);
+    expect(output.querySelector('span b br')).not.toBeNull();
+    expect(output.textContent).toBe('译First译Second');
+  });
+  it('refreshes changed source typography from cached translations and observes resize only during a session', async () => {
+    document.body.innerHTML = '<p>Read <span style="font-weight:700">this</span></p>';
+    const source = document.querySelector('span')!;
+    const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
+    const page = make(translate); page.start(); await completed(page);
+    expect(document.querySelector<HTMLElement>('[data-pt-owned] span')?.style.fontWeight).toBe('700');
+    source.style.fontWeight = '400';
+    await vi.waitFor(() => expect(document.querySelector<HTMLElement>('[data-pt-owned] span')?.style.fontWeight).toBe('400'));
+    // Model a media-query change: computed style changes with no source DOM mutation.
+    const computedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudo) => {
+      const style = computedStyle(element, pseudo);
+      if (element !== source) return style;
+      const changed = document.createElement('span').style;
+      changed.cssText = style.cssText; changed.fontWeight = '900';
+      return changed;
+    });
+    window.dispatchEvent(new Event('resize'));
+    await vi.waitFor(() => expect(document.querySelector<HTMLElement>('[data-pt-owned] span')?.style.fontWeight).toBe('900'));
+    expect(source.style.fontWeight).toBe('400');
+    expect(translate).toHaveBeenCalledOnce();
+    page.stop(); window.dispatchEvent(new Event('resize'));
+    await new Promise(resolve => setTimeout(resolve, 220));
+    expect(document.querySelector('[data-pt-owned]')).toBeNull();
+    expect(translate).toHaveBeenCalledOnce();
+  });
+  it('translates a visible same-origin mail reader, including its plaintext body, in the top session', async () => {
+    document.body.innerHTML = '<iframe title="邮件正文"></iframe><iframe title="邮件正文" hidden></iframe><iframe title="Advertisement"></iframe><pre>ordinary protected text</pre>';
+    const frames = [...document.querySelectorAll('iframe')];
+    const reader = frames[0].contentDocument!;
+    reader.body.innerHTML = '<pre>Hello reader!\n\nYour package was published.</pre><pre><code>private code</code></pre><div contenteditable="true">private reply</div>';
+    frames[1].contentDocument!.body.textContent = 'hidden message';
+    frames[2].contentDocument!.body.textContent = 'unrelated frame';
+    const original = reader.body.innerHTML;
+    const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
+    const page = make(translate); page.start(); await completed(page);
+    expect(reader.querySelector('pre > [data-pt-owned]')?.textContent).toContain('译Hello reader!');
+    expect(translate.mock.calls.flatMap(([texts]) => texts)).toEqual(['Hello reader!\n\nYour package was published.']);
+    reader.body.insertAdjacentHTML('beforeend', '<p>New mail paragraph</p>');
+    await vi.waitFor(() => expect(reader.querySelector('p [data-pt-owned]')?.textContent).toBe('译New mail paragraph'));
+    page.setMode('translated'); expect(reader.querySelector('pre')!.textContent).toContain('译Hello reader!');
+    expect(translate).toHaveBeenCalledTimes(2);
+    page.stop(); reader.querySelector('p')!.remove(); expect(reader.body.innerHTML).toBe(original);
+  });
+  it('ignores late results for a removed mail reader and restores a newly hidden reader', async () => {
+    document.body.innerHTML = '<iframe title="Message body"></iframe>';
+    const frame = document.querySelector('iframe')!, doc = frame.contentDocument!;
+    doc.body.innerHTML = '<p>First message</p>';
+    let finish!: (values: string[]) => void;
+    const page = make(() => new Promise(resolve => { finish = resolve; }));
+    page.start(); frame.hidden = true; finish(['第一封邮件']);
+    await vi.waitFor(() => expect(page.status().total).toBe(0));
+    expect(doc.querySelector('[data-pt-owned]')).toBeNull();
+    frame.hidden = false;
+    await vi.waitFor(() => expect(page.status().pending).toBe(1));
+    frame.remove(); finish(['迟到译文']); await completed(page);
+    expect(doc.querySelector('[data-pt-owned]')).toBeNull();
+  });
+  it('handles clickable inbox rows wrapped around unlabelled subject and metadata spans', async () => {
+    document.body.innerHTML = '<div class="mail-row"><a href="#open"><span class="mail-sender">Example</span><span class="title"><b>Release</b> details</span><time>Yesterday</time></a></div>';
+    const page = make(); page.start(); await completed(page);
+    expect(document.querySelector('.title > [data-pt-owned]')?.textContent).toBe('（译Release 译details）');
+    expect(document.querySelector('a > [data-pt-owned],time > [data-pt-owned],.mail-sender > [data-pt-owned]')).toBeNull();
+  });
+  it('keeps mail subject translations inside their column and omits sender and date fields', async () => {
+    document.body.innerHTML = '<ul><li role="row"><span data-field="sender">Example Sender</span><span role="gridcell"><b>Package published</b></span><time>Yesterday</time></li></ul>';
+    const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
+    const page = make(translate); page.start(); await completed(page);
+    expect(document.querySelector('[role="gridcell"] > [data-pt-owned]')?.textContent).toBe('（译Package published）');
+    expect(document.querySelector('li > [data-pt-owned]')).toBeNull();
+    expect(translate.mock.calls.flatMap(([texts]) => texts)).toEqual(['Package published']);
   });
   it('separates CSS block paragraphs while retaining inline punctuation and spaces', async () => {
     document.body.innerHTML = '<section>\n<span style="display:block"><em>Hello</em> <a href="#world">world</a>!</span>\n<span style="display:block">Next paragraph.</span>\n</section>';
