@@ -48,12 +48,13 @@ const formatParts = new Map([
   ['You have to build critical thinking into your day, because by default nothing will do it for you.', '你必须把批判性思维融入日常，因为默认情况下，没有什么会替你完成这件事。'],
   ['Read', '阅读'], ['bold', '加粗'], ['and italic', '与斜体'], ['underlined', '下划线'], ['removed', '删除线'], ['highlighted', '高亮'], ['two', '二'], ['the guide', '这份指南'], ['now', '现在'], ['A', '一段'], ['styled phrase', '带样式的文字'], ['in a paragraph.', '在段落中。'], ['First line', '第一行'], ['Second line', '第二行'], ['and preserved\n  spacing', '保留换行\n  和空格'],
 ]);
-const mailFixture = `<!doctype html><meta charset="utf-8"><style>.mail-row{display:grid;grid-template-columns:100px minmax(0,1fr) 60px;height:32px}.mail-row>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}iframe{width:96%;height:250px}</style>
+const mailFixture = `<!doctype html><meta charset="utf-8"><style>.mail-row{display:grid;grid-template-columns:100px minmax(0,1fr) 60px;min-height:32px}.mail-row>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}iframe{width:96%;height:250px}</style>
 <nav><a href="#inbox">收 件</a> <a href="#reply">回 复</a></nav>
 <div class="mail-row" role="row"><span data-field="sender">Example Sender</span><span data-field="subject">Release is ready</span><time>昨天</time></div>
-<div class="mail-row" role="row"><span data-field="sender">Example Sender</span><span data-field="subject">您的账户通知</span><time>周一</time></div>
+<div class="mail-row" role="row"><span data-field="sender">Example Sender</span><span data-field="subject">你的 ExampleCloud Pro 储存空间已经用完，请及时登录账户清理。</span><time>周一</time></div>
 <iframe id="reader" title="邮件正文" src="/message-body"></iframe><iframe title="邮件正文" sandbox srcdoc="<p>Sandbox sample</p>"></iframe><iframe hidden title="邮件正文" srcdoc="<p>Hidden sample</p>"></iframe>`;
-const messageFixture = '<!doctype html><meta charset="utf-8"><pre>Hello reader!\n\nYour release is available.</pre><code>Code sample</code><div contenteditable="true">Reply draft</div>';
+const mailParagraphs = ['Hello reader!', 'Your release is available;\nread the notes at https://example.test/releases.', 'The checksum is abc123.', 'Thank you!'];
+const messageFixture = `<!doctype html><meta charset="utf-8"><pre style="white-space:pre-wrap">${mailParagraphs.join('\n\n')}</pre><code>Code sample</code><div contenteditable="true">Reply draft</div>`;
 const requests = [];
 const server = createServer(async (req, res) => {
   if (req.method === 'POST') {
@@ -371,6 +372,7 @@ try {
   await otherPage.waitForFunction(() => !document.querySelector('[data-pt-owned="translation"]'));
   assert.equal(await otherPage.locator('main').innerHTML(), formatOriginal);
   assert.equal(requests.length, formatRequests, 'Formatting, resizing, links and mode changes must use cached translations');
+  await otherPage.setViewportSize({ width: 1280, height: 900 });
   await otherPage.goto(address + '/mail'); await otherPage.bringToFront(); await otherPopup.reload();
   // A different loopback hostname is a different origin, even though both use this fixture server.
   await otherPage.evaluate(async url => {
@@ -387,11 +389,31 @@ try {
   assert.match(await reader.locator('pre > [data-pt-owned]').textContent(), /译Hello reader!/);
   const subjectTranslation = otherPage.locator('[data-field="subject"] > [data-pt-owned]');
   assert.equal(await subjectTranslation.count(), 1);
-  assert.ok(await subjectTranslation.evaluate(el => el === el.parentNode.firstChild && el.title.includes('Release is ready')));
-  assert.deepEqual(await rowGeometry(), originalRows, 'Subject translations must not displace adjacent rows or the time column');
+  assert.ok(await subjectTranslation.evaluate(el => el === el.parentNode.lastChild && el.title.includes('Release is ready') && getComputedStyle(el).display === 'inline'));
+  assert.deepEqual(await rowGeometry(), originalRows, 'When there is enough space the row should stay compact');
+  const beforeMailResize = requests.length;
+  await otherPage.setViewportSize({ width: 235, height: 844 });
+  await otherPage.waitForFunction(() => getComputedStyle(document.querySelector('[data-field="subject"] > [data-pt-owned]')).display === 'block');
+  assert.ok(await subjectTranslation.evaluate(el => {
+    const box = el.getBoundingClientRect(), cell = el.parentElement.getBoundingClientRect();
+    const source = document.createRange(); source.selectNode(el.previousSibling);
+    return box.top >= source.getBoundingClientRect().bottom - 1 && Math.abs(box.left - cell.left) <= 1 && box.right <= cell.right + 1;
+  }), 'The next line stays aligned beneath the source subject, not at the row start');
+  const firstRow = otherPage.locator('.mail-row').first();
+  await firstRow.evaluate(el => { el.style.height = '32px'; });
+  await otherPage.waitForFunction(() => {
+    const output = document.querySelector('[data-field="subject"] > [data-pt-owned]');
+    return getComputedStyle(output).display === 'none' && output.parentElement.title.includes('译Release is ready');
+  });
+  await firstRow.evaluate(el => { el.style.removeProperty('height'); });
+  await otherPage.setViewportSize({ width: 1280, height: 900 });
+  await otherPage.waitForFunction(() => getComputedStyle(document.querySelector('[data-field="subject"] > [data-pt-owned]')).display === 'inline');
+  assert.equal(await otherPage.locator('[data-field="subject"]').first().getAttribute('title'), null);
+  assert.equal(requests.length, beforeMailResize);
   assert.equal(await otherPage.locator('nav [data-pt-owned],time [data-pt-owned],[data-field="sender"] [data-pt-owned],.mail-row > [data-pt-owned]').count(), 0);
   const sentMail = requests.slice(beforeMail).flatMap(r => JSON.parse(r.data.input).texts);
-  assert.deepEqual(sentMail.sort(), ['Hello reader!\n\nYour release is available.', 'Release is ready'].sort());
+  assert.deepEqual(sentMail.sort(), [...mailParagraphs, 'Release is ready'].sort());
+  assert.equal(await reader.locator('pre > [data-pt-owned]').textContent(), mailParagraphs.map(part => `译${part}`).join('\n\n'));
   await otherPage.locator('#reader').evaluate(el => { el.srcdoc = '<p>Next message</p>'; });
   await reader.locator('p > [data-pt-owned]').waitFor();
   const afterMail = requests.length;

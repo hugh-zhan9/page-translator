@@ -6,6 +6,7 @@ const MAIL_BODY = '[aria-label="邮件正文"],[aria-label="Message body" i],.ma
 const NETEASE_READER = '.gRead-content,[id^="_mail_read_"],#contentDiv';
 const MAIL_META = 'time,[data-field="sender"],[data-field="from"],[data-field="date"],.mail-sender,.mail-date';
 const MAIL_ROWS = 'tr,[role="row"],.mail-row,.nui-list-item';
+const MAIL_DATE = /^(?:今天|昨天|昨日|前天|\d{1,2}月\d{1,2}日|\d{1,2}:\d{2}(?::\d{2})?)$/u;
 function neteaseMail(document: Document): boolean {
   return /(^|\.)mail\.163\.com$/.test(document.location.hostname);
 }
@@ -29,6 +30,49 @@ function mailField(row: Element, element: Element): Element {
     parent = field;
   }
   return element;
+}
+function afterSource(block: Element, nodes: NodeText[], output: HTMLElement) {
+  // In mail rows the subject may be direct text followed by a date or action span.
+  let last: Node = nodes[nodes.length - 1].node;
+  while (last.parentNode && last.parentNode !== block) last = last.parentNode;
+  block.insertBefore(output, last.parentNode === block ? last.nextSibling : null);
+}
+function clearInboxTooltip(block: Element, output: HTMLElement) {
+  if (output.dataset.ptTooltip === block.getAttribute('title')) block.removeAttribute('title');
+  delete output.dataset.ptTooltip;
+}
+function fitInboxTranslation(block: Element, output: HTMLElement, lastSource: Text) {
+  clearInboxTooltip(block, output);
+  output.style.setProperty('display', 'inline', 'important');
+  output.style.setProperty('white-space', 'nowrap', 'important');
+  output.style.removeProperty('overflow-wrap');
+  // Use the actual output geometry, including bold text, links and the subject's font.
+  const rects = output.getClientRects();
+  // A plain inline wrapper has no column of its own. Leave its natural wrapping alone.
+  if (!block.clientWidth || !rects.length) return;
+  const blockBox = block.getBoundingClientRect();
+  const doc = block.ownerDocument;
+  const range = doc.createRange();
+  range.selectNodeContents(lastSource);
+  const sourceRects = [...range.getClientRects()].filter(rect => rect.width && rect.height);
+  const last = sourceRects.at(-1);
+  if (!last) return;
+  const fits = rects.length === 1 && rects[0].top < last.bottom && rects[0].bottom > last.top &&
+    rects[0].right <= blockBox.left + block.clientLeft + block.clientWidth + 1 && rects[0].left >= blockBox.left - 1;
+  if (fits) return;
+  output.style.setProperty('display', 'block', 'important');
+  output.style.setProperty('white-space', 'normal', 'important');
+  output.style.overflowWrap = 'anywhere';
+  const row = mailRow(block);
+  if (row && output.getBoundingClientRect().bottom > row.getBoundingClientRect().bottom + 1) {
+    // A fixed-height row cannot admit another line. An inline tooltip trigger
+    // would also be clipped, so place the full bilingual tooltip on the subject.
+    output.style.setProperty('display', 'none', 'important');
+    if (!block.hasAttribute('title')) {
+      block.setAttribute('title', output.title);
+      output.dataset.ptTooltip = output.title;
+    }
+  }
 }
 function readerDocument(frame: HTMLIFrameElement): Document | null {
   const parent = frame.ownerDocument;
@@ -209,11 +253,11 @@ export function collect(document: Document, sourceOf: (node: Text) => string = n
       // Some readers put a whole plaintext message in a single pre. Code samples remain protected.
       const plainBody = pre.closest(MAIL_BODY) || ((reader || neteaseMail(document)) && pre.closest(NETEASE_READER)) ||
         (reader && (pre.parentElement === document.body || document.body.querySelectorAll('pre').length === 1));
-      if (!plainBody || pre.matches('[class*="language-"],[class*="highlight"],[data-language]') || pre.querySelector('code,kbd,samp') ||
-        /(?:^|\n)\s*(?:const |let |var |function |import |class |def |#!)|[{};]\s*(?:\n|$)/m.test(source)) continue;
+      if (!plainBody || pre.matches('[class*="language-"],[class*="highlight"],[data-language]') ||
+        /^\s*(?:#!|(?:const|let|var)\s+[\w$]+\s*=|(?:async\s+)?function\s+[\w$]+\s*\(|(?:class|def)\s+\w+\s*[(:{])/u.test(source)) continue;
     }
     const row = reader ? null : mailRow(parent);
-    if (row && parent.closest(MAIL_META)) continue;
+    if (row && (parent.closest(MAIL_META) || MAIL_DATE.test(source.trim()))) continue;
     // Mail list rows can position inline sender, subject and time spans as independent columns.
     const block = pre ?? (row ? mailField(row, parent) : blockOf(parent));
     const nodes = groups.get(block) ?? [];
@@ -295,7 +339,10 @@ export class PageTranslation {
       record.block.contains(n.node) && n.node.parentElement?.closest('a') === n.link && n.node.data === (n.translated ?? n.source));
   }
   private restore(record: RecordEntry) {
-    record.output?.remove(); record.output = undefined;
+    if (record.output) {
+      clearInboxTooltip(record.block, record.output);
+      record.output.remove(); record.output = undefined;
+    }
     for (const n of record.nodes) {
       if (n.translated !== undefined && n.node.data === n.translated) n.node.data = n.source;
       n.translated = undefined;
@@ -308,7 +355,10 @@ export class PageTranslation {
     const document = record.block.ownerDocument;
     const view = projected ?? translatedView(document, record);
     record.presentation = JSON.stringify(view);
-    record.output?.remove(); record.output = undefined;
+    if (record.output) {
+      clearInboxTooltip(record.block, record.output);
+      record.output.remove(); record.output = undefined;
+    }
     record.nodes.forEach((n, i) => {
       n.node.data = this.mode === 'translated' ? values[i] : n.source;
       n.translated = this.mode === 'translated' ? values[i] : undefined;
@@ -336,11 +386,10 @@ export class PageTranslation {
       if (inline) output.append('（');
       appendView(document, output, view);
       if (inline) output.append('）');
-      // A subject cell with ellipsis can clip the entire appended translation. Keep both in the
-      // cell, with the translation visible first and the full pair available on hover.
-      if (inboxField && style.textOverflow === 'ellipsis') {
+      if (inboxField) {
         output.title = `${translation}\n${source}`;
-        record.block.prepend(output);
+        afterSource(record.block, record.nodes, output);
+        fitInboxTranslation(record.block, output, record.nodes.at(-1)!.node);
       } else record.block.append(output);
       record.output = output;
     }
@@ -382,7 +431,10 @@ export class PageTranslation {
       for (const record of this.records.values()) {
         if (record.state !== 'done') continue;
         const view = translatedView(record.block.ownerDocument, record);
-        if (record.presentation !== JSON.stringify(view)) this.render(record, view);
+        if (record.presentation !== JSON.stringify(view) || (record.output && !record.output.isConnected)) this.render(record, view);
+        else if (record.output && record.block.ownerDocument === this.document && mailRow(record.block)) {
+          fitInboxTranslation(record.block, record.output, record.nodes.at(-1)!.node);
+        }
       }
     });
     this.pump();
@@ -407,8 +459,12 @@ export class PageTranslation {
     };
     try {
       type Piece = { record: RecordEntry; nodeIndex: number; source: string };
-      const pieces: Piece[] = records.flatMap(record => record.nodes.flatMap((node, nodeIndex) =>
-        splitText(node.source).map(source => ({ record, nodeIndex, source }))));
+      const pieces: Piece[] = records.flatMap(record => record.nodes.flatMap((node, nodeIndex) => {
+        // Blank lines in a plain mail body are paragraph boundaries, not a single
+        // completion target. Keep the separators local and keep each result in order.
+        const blocks = record.block.matches('pre') ? node.source.split(/((?:\r?\n[\t ]*){2,})/) : [node.source];
+        return blocks.flatMap(block => splitText(block).map(source => ({ record, nodeIndex, source })));
+      }));
       const results = new Map<Piece, string>();
       for (const piece of pieces) if (!/\p{L}/u.test(piece.source)) results.set(piece, piece.source);
       const pending = pieces.filter(piece => !results.has(piece));

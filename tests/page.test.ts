@@ -226,7 +226,7 @@ describe('live webpage translation', () => {
     const translate = vi.fn(async (texts: string[]) => texts.map(t => `译${t}`));
     const page = make(translate); page.start(); await completed(page);
     expect(reader.querySelector('pre > [data-pt-owned]')?.textContent).toContain('译Hello reader!');
-    expect(translate.mock.calls.flatMap(([texts]) => texts)).toEqual(['Hello reader!\n\nYour package was published.']);
+    expect(translate.mock.calls.flatMap(([texts]) => texts)).toEqual(['Hello reader!', 'Your package was published.']);
     reader.body.insertAdjacentHTML('beforeend', '<p>New mail paragraph</p>');
     await vi.waitFor(() => expect(reader.querySelector('p [data-pt-owned]')?.textContent).toBe('译New mail paragraph'));
     page.setMode('translated'); expect(reader.querySelector('pre')!.textContent).toContain('译Hello reader!');
@@ -252,6 +252,30 @@ describe('live webpage translation', () => {
     const page = make(); page.start(); await completed(page);
     expect(document.querySelector('.title > [data-pt-owned]')?.textContent).toBe('（译Release 译details）');
     expect(document.querySelector('a > [data-pt-owned],time > [data-pt-owned],.mail-sender > [data-pt-owned]')).toBeNull();
+  });
+  it('sends every prose paragraph of a plaintext email, while protecting marked code', async () => {
+    document.body.innerHTML = '<iframe title="Message body"></iframe>';
+    const reader = document.querySelector('iframe')!.contentDocument!;
+    const parts = ['Hello reader!', 'A new version of Example was published;\nread the notes at https://example.test/releases.', 'The checksum is abc123.', 'Thanks!'];
+    reader.body.innerHTML = `<pre>${parts.join('\n\n')}</pre><pre class="language-js">runExample()</pre><pre>const sample = 1;</pre>`;
+    const original = reader.body.innerHTML;
+    const translator = vi.fn(async (texts: string[]) => texts.map((text) => `译${text.trim()}`));
+    const page = make(translator); page.start(); await completed(page);
+    expect(translator.mock.calls.flatMap(([texts]) => texts).map(text => text.trim())).toEqual(parts);
+    expect(reader.querySelector('pre > [data-pt-owned]')?.textContent).toBe(parts.map(part => `译${part}`).join('\n\n'));
+    page.setMode('translated');
+    expect(reader.querySelector('pre')?.textContent).toBe(parts.map(part => `译${part}`).join('\n\n'));
+    page.stop(); expect(reader.body.innerHTML).toBe(original);
+    expect(translator).toHaveBeenCalledOnce();
+  });
+  it('does not use a shared inbox wrapper containing unlabelled metadata as the subject', async () => {
+    document.body.innerHTML = '<div class="mail-row"><input type="checkbox"><a href="#open">Release is ready <span>11月23日</span></a></div>';
+    const translator = vi.fn(async (texts: string[]) => texts.map(text => `译${text.trim()}`));
+    const page = make(translator); page.start(); await completed(page);
+    expect(translator.mock.calls.flatMap(([texts]) => texts).map(text => text.trim())).toEqual(['Release is ready']);
+    expect(document.querySelector('a > [data-pt-owned]')?.textContent).toBe('（译Release is ready）');
+    expect(document.querySelector('a > span:not([data-pt-owned])')?.textContent).toBe('11月23日');
+    expect(document.querySelector('a')?.childNodes[1]).toBe(document.querySelector('[data-pt-owned]'));
   });
   it('keeps mail subject translations inside their column and omits sender and date fields', async () => {
     document.body.innerHTML = '<ul><li role="row"><span data-field="sender">Example Sender</span><span role="gridcell"><b>Package published</b></span><time>Yesterday</time></li></ul>';

@@ -7,6 +7,9 @@ import assert from 'node:assert/strict';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const copy = await mkdtemp(path.join(tmpdir(), 'page-translator-mutations-'));
 const mutants = [
+  { name: 'skip no Chinese-majority text', file: 'src/provider.ts', from: 'if (han > latin) return true;', to: 'if (han > 0 && latin === 0) return true;', test: 'tests/provider.test.ts' },
+  { name: 'send a whole plaintext email as one translation item', file: 'src/page.ts', from: "const blocks = record.block.matches('pre') ? node.source.split(/((?:\\r?\\n[\\t ]*){2,})/) : [node.source];", to: 'const blocks = [node.source];', test: 'tests/page.test.ts' },
+  { name: 'send inbox date labels with the subject', file: 'src/page.ts', from: ' || MAIL_DATE.test(source.trim())', to: '', test: 'tests/page.test.ts' },
   { name: 'ignore responsive typography changes', file: 'src/page.ts', from: "this.document.defaultView!.addEventListener('resize', this.onResize);", to: '', test: 'tests/page.test.ts' },
   { name: 'allow executable translated destinations', file: 'src/page.ts', from: '/^(https?:|mailto:|tel:)$/.test(link.protocol)', to: 'true', test: 'tests/page.test.ts' },
   // Projection no longer copies the outer link; deleting its defensive guard is equivalent for valid HTML.

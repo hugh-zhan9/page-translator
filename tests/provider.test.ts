@@ -21,14 +21,14 @@ describe('translation protocols', () => {
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer test-only-key');
   });
   it('returns Chinese UI text verbatim without sending an all-Chinese batch', async () => {
-    const texts = [' 收件箱（2） ', '使用 Gmail 登录', '查看 API 设置', '打开 GitHub 通知', '芙蓉碧潭', '11月23日', '支付成功 ¥128.00'];
+    const texts = [' 收件箱（2） ', '使用 Gmail 登录', '查看 API 设置', '打开 GitHub 通知', '芙蓉碧潭', '11月23日', '支付成功 ¥128.00', '你的 ExampleCloud Pro 储存空间已经用完，请及时登录账户清理。', '新版本已上线，详情请见 https://example.test/releases 或联系 help@example.test。'];
     const fetcher = vi.fn<typeof fetch>(async () => Response.json(output()));
     expect(await translate(settings, texts, fetcher)).toEqual(texts);
     expect(fetcher).not.toHaveBeenCalled();
   });
   it('sends mixed-language subjects and sentences and restores each result to its original position', async () => {
     const subject = '会议通知：Review';
-    const sentence = '这封邮件很重要，请在回复前确认所有细节。Please read it carefully.';
+    const sentence = '重要通知：Please read the full message carefully before replying.';
     const texts = ['收件箱', subject, '已发送', sentence, subject, '草稿'];
     const fetcher = vi.fn<typeof fetch>(async () => Response.json(output('{"translations":["会议通知：审阅","请仔细阅读。","会议通知：复核"]}')));
     expect(await translate(settings, texts, fetcher)).toEqual(['收件箱', '会议通知：审阅', '已发送', '请仔细阅读。', '会议通知：复核', '草稿']);

@@ -55,10 +55,17 @@ function alreadyChinese(text: string, target: ChineseTarget): boolean {
   if (!/\p{Script=Han}/u.test(text)) return false;
   if (target === 'Hans' && /[這們個為從對還進過時與開關發聯絡郵設帳戶號讀寫請簡體漢語譯頁網覽選項標記刪編輯檔夾歸類動顯處載複僅傳輸認訂務歡線會話組員間題學國見長門愛實數據幫現詢錄碼內廣閱電換謝買賣臺灣龍風車書資訊點擊測試]/u.test(text)) return false;
   if (target === 'Hant' && /[这们个为从对还进过时与开关发联络邮设账户号读写请简体汉语译页网览选项标记删编辑档夹归类动显处载复仅传输认订务欢线会话组员间题学国见长门爱实数据帮现询录码内广阅电换谢买卖湾龙风车书资讯点击测试]/u.test(text)) return false;
-  // Allow an isolated brand or acronym, while preserving ordinary English subjects
-  // (including single words) and any text containing kana, hangul or other scripts.
-  const words = text.replace(/\p{Script=Han}/gu, ' ').match(/[^\p{P}\p{S}\p{N}\s]+/gu) ?? [];
-  return words.length === 0 || /^(?:[A-Za-z]*[a-z][A-Z][A-Za-z]*|Gmail|Google(?: Meet| Workspace| Drive)?|Microsoft(?: Teams)?|Outlook|Chrome|Gemini|API|AI|PDF|URL|HTML|SMS|USB|VIP|ID)$/u.test(words.join(' '));
+  // Addresses, digits and punctuation are not evidence of another language.
+  const prose = text.replace(/https?:\/\/[^\s\p{Script=Han}]+|[\w.+-]+@[\w.-]+\.[a-z]{2,}/giu, ' ');
+  let han = 0, latin = 0;
+  for (const character of prose.match(/\p{L}/gu) ?? []) {
+    if (/\p{Script=Han}/u.test(character)) han++;
+    else if (/\p{Script=Latin}/u.test(character)) latin++;
+    else return false;
+  }
+  if (han > latin) return true;
+  const words = prose.replace(/\p{Script=Han}/gu, ' ').match(/[^\p{P}\p{S}\p{N}\s]+/gu) ?? [];
+  return /^(?:[A-Za-z]*[a-z][A-Z][A-Za-z]*|Gmail|Google(?: Meet| Workspace| Drive)?|Microsoft(?: Teams)?|Outlook|Chrome|Gemini|API|AI|PDF|URL|HTML|SMS|USB|VIP|ID)$/u.test(words.join(' '));
 }
 export async function translate(settings: Settings, input: unknown, fetcher: typeof fetch = fetch): Promise<string[]> {
   const texts = validateTexts(input);
